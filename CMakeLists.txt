@@ -3,4 +3,4 @@
 cmake_minimum_required(VERSION 3.5)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
-project(S3-IDF_NV3401A-QSPI_GT911-I2C_LVGL)
+project(S3-IDF_NV3041A-QSPI_GT911-I2C_LVGL)

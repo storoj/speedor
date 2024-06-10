@@ -15,7 +15,7 @@
 #include "lvgl.h"
 #include "lv_demos.h"
 
-#include "esp_lcd_nv3401a.h"
+#include "esp_lcd_nv3041a.h"
 #include "esp_lcd_touch_gt911.h"
 
 static const char *TAG = "example";
@@ -204,7 +204,7 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&bk_gpio_config));
 
     ESP_LOGI(TAG, "Initialize SPI bus");
-    const spi_bus_config_t buscfg = NV3401A_PANEL_BUS_QSPI_CONFIG(EXAMPLE_PIN_NUM_LCD_PCLK,
+    const spi_bus_config_t buscfg = NV3041A_PANEL_BUS_QSPI_CONFIG(EXAMPLE_PIN_NUM_LCD_PCLK,
                                                                  EXAMPLE_PIN_NUM_LCD_DATA0,
                                                                  EXAMPLE_PIN_NUM_LCD_DATA1,
                                                                  EXAMPLE_PIN_NUM_LCD_DATA2,
@@ -215,9 +215,9 @@ void app_main(void)
 
     ESP_LOGI(TAG, "Install panel IO");
     esp_lcd_panel_io_handle_t io_handle = NULL;
-    const esp_lcd_panel_io_spi_config_t io_config = NV3401A_PANEL_IO_QSPI_CONFIG(EXAMPLE_PIN_NUM_LCD_CS, example_notify_lvgl_flush_ready, &disp_drv);
+    const esp_lcd_panel_io_spi_config_t io_config = NV3041A_PANEL_IO_QSPI_CONFIG(EXAMPLE_PIN_NUM_LCD_CS, example_notify_lvgl_flush_ready, &disp_drv);
 
-    nv3401a_vendor_config_t vendor_config = {
+    nv3041a_vendor_config_t vendor_config = {
         .flags = {
             .use_qspi_interface = 1,
         },
@@ -234,8 +234,8 @@ void app_main(void)
         .vendor_config = &vendor_config,
     };
 
-    ESP_LOGI(TAG, "Install NV3401A panel driver");
-    ESP_ERROR_CHECK(esp_lcd_new_panel_nv3401a(io_handle, &panel_config, &panel_handle));
+    ESP_LOGI(TAG, "Install NV3041A panel driver");
+    ESP_ERROR_CHECK(esp_lcd_new_panel_nv3041a(io_handle, &panel_config, &panel_handle));
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
