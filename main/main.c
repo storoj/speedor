@@ -18,6 +18,15 @@
 #include "esp_lcd_nv3041a.h"
 #include "esp_lcd_touch_gt911.h"
 
+#include "ubxlib.h"
+
+#define U_CFG_APP_GNSS_UART 1
+#define U_CFG_APP_PIN_GNSS_TXD 17
+#define U_CFG_APP_PIN_GNSS_RXD 18
+// #define U_GNSS_UART_BAUD_RATE 115200
+
+#include "u_cfg_app_platform_specific.h"
+
 static const char *TAG = "example";
 static SemaphoreHandle_t lvgl_mux = NULL;
 
@@ -176,6 +185,50 @@ static void example_lvgl_port_task(void *arg)
     }
 }
 
+static char latLongToBits(int32_t thingX1e7,
+                          int32_t *pWhole,
+                          int32_t *pFraction)
+{
+    char prefix = '+';
+
+    // Deal with the sign
+    if (thingX1e7 < 0) {
+        thingX1e7 = -thingX1e7;
+        prefix = '-';
+    }
+    *pWhole = thingX1e7 / 10000000;
+    *pFraction = thingX1e7 % 10000000;
+
+    return prefix;
+}
+
+// Callback function to receive location.
+static void callback(uDeviceHandle_t devHandle,
+                     int32_t errorCode,
+                     const uLocation_t *pLocation)
+{
+    char prefix[2] = {0};
+    int32_t whole[2] = {0};
+    int32_t fraction[2] = {0};
+
+    // Not used
+    (void) devHandle;
+
+    if (errorCode == 0) {
+        prefix[0] = latLongToBits(pLocation->longitudeX1e7, &(whole[0]), &(fraction[0]));
+        prefix[1] = latLongToBits(pLocation->latitudeX1e7, &(whole[1]), &(fraction[1]));
+        ESP_LOGI("Location", "I am here: https://maps.google.com/?q=%c%d.%07d,%c%d.%07d\n",
+                 prefix[1], whole[1], fraction[1], prefix[0], whole[0], fraction[0]);
+        ESP_LOGI("Location", "Speed: %.3f m/s", ((double)pLocation->speedMillimetresPerSecond) / 1000);
+        ESP_LOGI("Location", "svs: %d", pLocation->svs);
+        ESP_LOGI("Location", "time: %"PRId64"", pLocation->timeUtc);
+    } else if (errorCode == U_ERROR_COMMON_TIMEOUT) {
+        ESP_LOGI("Location", "* Timeout");
+    } else {
+        ESP_LOGI("Location", "Error %d", errorCode);
+    }
+}
+
 void app_main(void)
 {
     static lv_disp_draw_buf_t disp_buf;
@@ -304,6 +357,111 @@ void app_main(void)
     
     lv_indev_drv_register(&indev_drv);
 
+    const uGnssModuleType_t module_type = U_GNSS_MODULE_TYPE_M10;
+
+    int32_t ubx_err = uPortInit();
+    if (ubx_err) {
+        ESP_LOGE("GPS", "UBXLIB Port init error: %" PRIi32, ubx_err);
+        return;
+    }
+    ubx_err = uGnssInit();
+    if (ubx_err) {
+        ESP_LOGE("GPS", "UBXLIB GNSS init error: %" PRIi32, ubx_err);
+        return;
+    }
+
+
+    uGnssTransportHandle_t transportHandle;
+    transportHandle.uart = uPortUartOpen(
+        U_CFG_APP_GNSS_UART, 9600, NULL, U_GNSS_UART_BUFFER_LENGTH_BYTES,
+        U_CFG_APP_PIN_GNSS_TXD, U_CFG_APP_PIN_GNSS_RXD, U_CFG_APP_PIN_GNSS_CTS,
+        U_CFG_APP_PIN_GNSS_RTS);
+
+    uDeviceHandle_t devHandle = NULL;
+    ubx_err = uGnssAdd(module_type, U_GNSS_TRANSPORT_UART,
+                       transportHandle, -1, true, &devHandle);
+    if (ubx_err) {
+      ESP_LOGE("GPS", "UBXLIB GNSS add error: %" PRIi32, ubx_err);
+      return;
+    }
+
+    uGnssSetUbxMessagePrint(devHandle, true);
+    ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_NMEA, false);
+    if (ubx_err) {
+      ESP_LOGE("GPS", "NMEA disable error %" PRIi32, ubx_err);
+      return;
+    }
+    ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_UBX, true);
+    if (ubx_err) {
+      ESP_LOGE("GPS", "UBX enable error %" PRIi32, ubx_err);
+      return;
+    }
+
+    // Power up the GNSS module
+    uGnssPwrOn(devHandle);
+
+/*
+    uint32_t ret = 0;
+    const uDeviceCfg_t gDeviceCfg = {
+        .deviceType = U_DEVICE_TYPE_GNSS,
+        .deviceCfg = {
+            .cfgGnss = {
+                .moduleType = module_type,
+                .pinEnablePower = U_CFG_APP_PIN_GNSS_ENABLE_POWER,
+                .pinDataReady = -1
+            },
+        },
+        .transportType = U_DEVICE_TRANSPORT_TYPE_UART,
+        .transportCfg = {
+            .cfgUart = {
+                .uart = U_CFG_APP_GNSS_UART,
+                .baudRate = U_GNSS_UART_BAUD_RATE, 
+                .pinTxd = U_CFG_APP_PIN_GNSS_TXD,  // Use -1 if on Zephyr or Linux or Windows
+                .pinRxd = U_CFG_APP_PIN_GNSS_RXD,  // Use -1 if on Zephyr or Linux or Windows
+                .pinCts = U_CFG_APP_PIN_GNSS_CTS,  // Use -1 if on Zephyr
+                .pinRts = U_CFG_APP_PIN_GNSS_RTS,  // Use -1 if on Zephyr
+                .pPrefix = NULL,
+            },
+        },
+    };
+
+    // NETWORK configuration for GNSS
+    const uNetworkCfgGnss_t gNetworkCfg = {
+        .type = U_NETWORK_TYPE_GNSS,
+        .moduleType = module_type,
+        .devicePinPwr = -1,
+        .devicePinDataReady = -1
+    };
+    ret = uDeviceOpen(&gDeviceCfg, &devHandle);
+    uPortLog("Opened device with return code %d.\n", ret);
+    if (ret == 0) {
+        // Bring up the GNSS network interface
+        uPortLog("Bringing up the network...\n");
+        if (uNetworkInterfaceUp(devHandle, U_NETWORK_TYPE_GNSS, &gNetworkCfg) == 0) {
+            if (0 != uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ITEM_RATE_MEAS_U2, 100, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM))
+            {
+                ESP_LOGI("Config", "Failed to set rate");
+            }
+            
+
+            // Start to get location
+            uPortLog("Starting continuous location.\n");
+            uLocationGetContinuousStart(devHandle,
+                    100,
+                    U_LOCATION_TYPE_GNSS,
+                    NULL, NULL, callback);
+
+            // // Stop getting location
+            // uLocationGetStop(devHandle);
+            //
+            // // When finished with the GNSS network layer
+            // uPortLog("Taking down GNSS...\n");
+            // uNetworkInterfaceDown(devHandle, U_NETWORK_TYPE_GNSS);
+        } else {
+            uPortLog("Unable to bring up GNSS!\n");
+        }
+    }
+    */
 
     lvgl_mux = xSemaphoreCreateMutex();
     assert(lvgl_mux);
