@@ -229,6 +229,51 @@ static void callback(uDeviceHandle_t devHandle,
     }
 }
 
+static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* pMessageId,
+    int32_t errorCodeOrLength, void* pCallbackParam) {
+    char* pBuffer = (char*)pCallbackParam;
+    int32_t length;
+    uGnssDec_t* pDec;
+    uGnssDecUbxNavPvt_t* pUbxNavPvt;
+    int64_t utcTimeNanoseconds;
+
+    (void)pMessageId;
+
+    if (errorCodeOrLength >= 0) {
+        // Read the message into our buffer
+        length = uGnssMsgReceiveCallbackRead(devHandle, pBuffer, errorCodeOrLength);
+        if (length >= 0) {
+            // Call the uGnssDec() API to decode the message
+            pDec = pUGnssDecAlloc(pBuffer, length);
+            if ((pDec != NULL) && (pDec->errorCode == 0)) {
+                // No need to check pDec->id (or pMessageId) here since we have
+                // only asked for UBX-NAV-PVT messages.
+                pUbxNavPvt = &(pDec->pBody->ubxNavPvt);
+
+                utcTimeNanoseconds = uGnssDecUbxNavPvtGetTimeUtc(pUbxNavPvt);
+
+                int32_t lat = pUbxNavPvt->lat;
+                int32_t lon = pUbxNavPvt->lon;
+                int32_t alt = pUbxNavPvt->hMSL;
+                int32_t hAcc = pUbxNavPvt->hAcc;
+
+                uGnssDecUbxNavPvtFixType_t fix_status = pUbxNavPvt->fixType;
+
+                uint8_t sats_used = pUbxNavPvt->numSV;
+
+                ESP_LOGI("Location",
+                        "t: %"PRId64", lat: %"PRIi32 ", lon: %"PRIi32 ", alt: %"PRIi32 ", hacc: %"PRIi32", fix: %d",
+                        utcTimeNanoseconds, lat, lon, alt, hAcc, fix_status);
+
+                // xTaskNotify(telemetry_task, 0, eNoAction);
+            }
+            uGnssDecFree(pDec);
+        }
+    } else {
+        ESP_LOGI("GPS", "Empty or bad message received.");
+    }
+}
+
 void app_main(void)
 {
     static lv_disp_draw_buf_t disp_buf;
@@ -389,16 +434,56 @@ void app_main(void)
     ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_NMEA, false);
     if (ubx_err) {
       ESP_LOGE("GPS", "NMEA disable error %" PRIi32, ubx_err);
-      return;
     }
     ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_UBX, true);
     if (ubx_err) {
       ESP_LOGE("GPS", "UBX enable error %" PRIi32, ubx_err);
-      return;
     }
 
     // Power up the GNSS module
     uGnssPwrOn(devHandle);
+
+    ubx_err = uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ID_MSGOUT_UBX_NAV_PVT_UART1_U1,
+            1, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM);
+    if (ubx_err != 0) {
+      ESP_LOGE("GPS", "UBX Set UBX rate error: %" PRIi32, ubx_err);
+    }
+
+    // ubx_err = uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ID_NAVSPG_USE_PPP_L,
+    //         1, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM);
+    // if (ubx_err != 0) {
+    //   ESP_LOGE("GPS", "UBX Set PPP error: %" PRIi32, ubx_err);
+    // }
+
+    ESP_LOGI("CFG", "Dynamic model before: %"PRIi32, uGnssCfgGetDynamic(devHandle));
+
+    ubx_err = uGnssCfgSetDynamic(devHandle, U_GNSS_DYNAMIC_AUTOMOTIVE);
+    if (ubx_err != 0) {
+      ESP_LOGE("GPS", "UBX Set dynmodel error: %" PRIi32, ubx_err);
+    }
+    ESP_LOGI("CFG", "Dynamic model after: %"PRIi32, uGnssCfgGetDynamic(devHandle));
+
+    int32_t measprdms = 100;
+    int32_t measpernav = 1;
+
+    ubx_err = uGnssCfgSetRate(devHandle, measprdms, measpernav, -1);
+    if (ubx_err) {
+        ESP_LOGE("GPS", "UBXLIB GNSS rate error: %" PRIi32, ubx_err);
+        return;
+    }
+
+    char *gps_ubx_buf = (char*)pUPortMalloc(92 + U_UBX_PROTOCOL_OVERHEAD_LENGTH_BYTES);
+
+    uGnssMessageId_t messageId;
+    messageId.type = U_GNSS_PROTOCOL_UBX;
+    messageId.id.ubx = U_GNSS_UBX_MESSAGE(
+            U_GNSS_DEC_UBX_NAV_PVT_MESSAGE_CLASS,
+            U_GNSS_DEC_UBX_NAV_PVT_MESSAGE_ID
+            );
+
+    uGnssMsgReceiveStart(devHandle, &messageId, gps_ubx_callback, gps_ubx_buf);
+
+    ESP_LOGI("GPS", "Successfully init GPS!");
 
 /*
     uint32_t ret = 0;
