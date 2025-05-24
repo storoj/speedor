@@ -20,6 +20,15 @@
 
 #include "ubxlib.h"
 
+void lv_app();
+void init_gps(char *status_msg);
+void init_gps_task(void*);
+
+static lv_obj_t *speed_label;
+static lv_obj_t *speed_meter;
+static lv_meter_indicator_t *speed_needle;
+static lv_obj_t *status_label;
+
 #define U_CFG_APP_GNSS_UART 1
 #define U_CFG_APP_PIN_GNSS_TXD 17
 #define U_CFG_APP_PIN_GNSS_RXD 18
@@ -260,10 +269,34 @@ static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* 
                 uGnssDecUbxNavPvtFixType_t fix_status = pUbxNavPvt->fixType;
 
                 uint8_t sats_used = pUbxNavPvt->numSV;
+                int32_t speed_mm_s = pUbxNavPvt->gSpeed;
+                int32_t speed_km_h = 9 * speed_mm_s / 2500;
+
+                example_lvgl_lock(-1);
+                lv_label_set_text_fmt(speed_label, "%d", (int)speed_km_h);
+                lv_meter_set_indicator_value(speed_meter, speed_needle, speed_km_h);
+                lv_label_set_text_fmt(status_label,
+                        "lat: %"PRIi32 "\n"
+                        "lon: %"PRIi32 "\n"
+                        "alt: %"PRIi32 "\n"
+                        "hacc: %"PRIi32"\n"
+                        "fix: %d\n"
+                        "sats: %d\n"
+                        "spd_mm_s: %"PRIi32"\n"
+                        "spd_km_h: %"PRIi32"\n",
+                        lat, lon, alt, hAcc, fix_status, sats_used, speed_mm_s, speed_km_h);
+                example_lvgl_unlock();
 
                 ESP_LOGI("Location",
-                        "t: %"PRId64", lat: %"PRIi32 ", lon: %"PRIi32 ", alt: %"PRIi32 ", hacc: %"PRIi32", fix: %d",
-                        utcTimeNanoseconds, lat, lon, alt, hAcc, fix_status);
+                        "t: %"PRId64" "
+                        "lat: %"PRIi32 " "
+                        "lon: %"PRIi32 " "
+                        "alt: %"PRIi32 " "
+                        "hacc: %"PRIi32" "
+                        "fix: %d "
+                        "spd_mm_s: %"PRIi32" "
+                        "spd_km_h: %"PRIi32" ",
+                        utcTimeNanoseconds, lat, lon, alt, hAcc, fix_status, speed_mm_s, speed_km_h);
 
                 // xTaskNotify(telemetry_task, 0, eNoAction);
             }
@@ -322,6 +355,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_handle, false));
 
     ESP_LOGI(TAG, "Initialize I2C bus");
     const i2c_config_t i2c_conf = {
@@ -402,20 +436,77 @@ void app_main(void)
     
     lv_indev_drv_register(&indev_drv);
 
+    lvgl_mux = xSemaphoreCreateMutex();
+    assert(lvgl_mux);
+    xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
+
+    ESP_LOGI(TAG, "Display LVGL demos");
+    if (example_lvgl_lock(-1)) {
+        // lv_demo_widgets();
+        // lv_demo_music();
+        // lv_demo_stress();
+        // lv_demo_benchmark();
+        lv_app();
+        example_lvgl_unlock();
+    }
+    xTaskCreate(init_gps_task, "GPS_INIT", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, 3, NULL);
+}
+
+static void status_set_text_fmt(const char * fmt, ...) {
+    example_lvgl_lock(-1);
+
+    va_list args;
+    va_start(args, fmt);
+    lv_label_set_text_fmt(status_label, fmt, args);
+    va_end(args);
+
+    example_lvgl_unlock();
+}
+
+static char * status_append_fmt(char *status, char *tail, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    tail += vsprintf(tail, fmt, args);
+    va_end(args);
+
+    example_lvgl_lock(-1);
+    lv_label_set_text(status_label, status);
+    example_lvgl_unlock();
+
+    return tail;
+}
+
+void init_gps_task(void *) {
+    char buf[1024];
+    init_gps(buf);
+    vTaskDelete(NULL);
+}
+
+void init_gps(char *status_msg) {
     const uGnssModuleType_t module_type = U_GNSS_MODULE_TYPE_M10;
 
+    *status_msg = 0;
+    char *tail = status_msg;
+
+    tail = status_append_fmt(status_msg, tail, "uPortInit...");
     int32_t ubx_err = uPortInit();
     if (ubx_err) {
         ESP_LOGE("GPS", "UBXLIB Port init error: %" PRIi32, ubx_err);
+        tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
         return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
+
+    tail = status_append_fmt(status_msg, tail, "uGnssInit...");
     ubx_err = uGnssInit();
     if (ubx_err) {
         ESP_LOGE("GPS", "UBXLIB GNSS init error: %" PRIi32, ubx_err);
+        tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
         return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
 
-
+    tail = status_append_fmt(status_msg, tail, "UART 9600...");
     uGnssTransportHandle_t transportHandle;
     transportHandle.uart = uPortUartOpen(
         U_CFG_APP_GNSS_UART, 9600, NULL, U_GNSS_UART_BUFFER_LENGTH_BYTES,
@@ -423,31 +514,45 @@ void app_main(void)
         U_CFG_APP_PIN_GNSS_RTS);
 
     uDeviceHandle_t devHandle = NULL;
-    ubx_err = uGnssAdd(module_type, U_GNSS_TRANSPORT_UART,
-                       transportHandle, -1, true, &devHandle);
+    ubx_err = uGnssAdd(module_type, U_GNSS_TRANSPORT_UART, transportHandle, -1, true, &devHandle);
     if (ubx_err) {
       ESP_LOGE("GPS", "UBXLIB GNSS add error: %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
       return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
 
     uGnssSetUbxMessagePrint(devHandle, true);
+    tail = status_append_fmt(status_msg, tail, "Disable NMEA...");
     ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_NMEA, false);
     if (ubx_err) {
       ESP_LOGE("GPS", "NMEA disable error %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
+      return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
+
+    tail = status_append_fmt(status_msg, tail, "Enable UBX...");
     ubx_err = uGnssCfgSetProtocolOut(devHandle, U_GNSS_PROTOCOL_UBX, true);
     if (ubx_err) {
       ESP_LOGE("GPS", "UBX enable error %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
+      return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
 
     // Power up the GNSS module
     uGnssPwrOn(devHandle);
 
+    tail = status_append_fmt(status_msg, tail, "Set UBX Rate...");
     ubx_err = uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ID_MSGOUT_UBX_NAV_PVT_UART1_U1,
             1, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM);
-    if (ubx_err != 0) {
+    if (ubx_err) {
       ESP_LOGE("GPS", "UBX Set UBX rate error: %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
+      return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
 
     // ubx_err = uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ID_NAVSPG_USE_PPP_L,
     //         1, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM);
@@ -455,22 +560,34 @@ void app_main(void)
     //   ESP_LOGE("GPS", "UBX Set PPP error: %" PRIi32, ubx_err);
     // }
 
-    ESP_LOGI("CFG", "Dynamic model before: %"PRIi32, uGnssCfgGetDynamic(devHandle));
+    int32_t dynamic_model = uGnssCfgGetDynamic(devHandle);
+    ESP_LOGI("CFG", "Dynamic model before: %"PRIi32, dynamic_model);
+    tail = status_append_fmt(status_msg, tail, "Dynamic model before: %"PRIi32"\n", dynamic_model);
 
+    tail = status_append_fmt(status_msg, tail, "Set dynamic model...");
     ubx_err = uGnssCfgSetDynamic(devHandle, U_GNSS_DYNAMIC_AUTOMOTIVE);
-    if (ubx_err != 0) {
+    if (ubx_err) {
       ESP_LOGE("GPS", "UBX Set dynmodel error: %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
+      return;
     }
-    ESP_LOGI("CFG", "Dynamic model after: %"PRIi32, uGnssCfgGetDynamic(devHandle));
+    tail = status_append_fmt(status_msg, tail, " OK\n");
+
+    dynamic_model = uGnssCfgGetDynamic(devHandle);
+    ESP_LOGI("CFG", "Dynamic model after: %"PRIi32, dynamic_model);
+    tail = status_append_fmt(status_msg, tail, "Dynamic model after: %"PRIi32"\n", dynamic_model);
 
     int32_t measprdms = 100;
     int32_t measpernav = 1;
 
+    tail = status_append_fmt(status_msg, tail, "Set Rate 10hz...");
     ubx_err = uGnssCfgSetRate(devHandle, measprdms, measpernav, -1);
     if (ubx_err) {
         ESP_LOGE("GPS", "UBXLIB GNSS rate error: %" PRIi32, ubx_err);
+        tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
         return;
     }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
 
     char *gps_ubx_buf = (char*)pUPortMalloc(92 + U_UBX_PROTOCOL_OVERHEAD_LENGTH_BYTES);
 
@@ -484,81 +601,82 @@ void app_main(void)
     uGnssMsgReceiveStart(devHandle, &messageId, gps_ubx_callback, gps_ubx_buf);
 
     ESP_LOGI("GPS", "Successfully init GPS!");
+}
 
-/*
-    uint32_t ret = 0;
-    const uDeviceCfg_t gDeviceCfg = {
-        .deviceType = U_DEVICE_TYPE_GNSS,
-        .deviceCfg = {
-            .cfgGnss = {
-                .moduleType = module_type,
-                .pinEnablePower = U_CFG_APP_PIN_GNSS_ENABLE_POWER,
-                .pinDataReady = -1
-            },
-        },
-        .transportType = U_DEVICE_TRANSPORT_TYPE_UART,
-        .transportCfg = {
-            .cfgUart = {
-                .uart = U_CFG_APP_GNSS_UART,
-                .baudRate = U_GNSS_UART_BAUD_RATE, 
-                .pinTxd = U_CFG_APP_PIN_GNSS_TXD,  // Use -1 if on Zephyr or Linux or Windows
-                .pinRxd = U_CFG_APP_PIN_GNSS_RXD,  // Use -1 if on Zephyr or Linux or Windows
-                .pinCts = U_CFG_APP_PIN_GNSS_CTS,  // Use -1 if on Zephyr
-                .pinRts = U_CFG_APP_PIN_GNSS_RTS,  // Use -1 if on Zephyr
-                .pPrefix = NULL,
-            },
-        },
-    };
+void lv_app() {
+    lv_obj_t *screen = lv_scr_act();
 
-    // NETWORK configuration for GNSS
-    const uNetworkCfgGnss_t gNetworkCfg = {
-        .type = U_NETWORK_TYPE_GNSS,
-        .moduleType = module_type,
-        .devicePinPwr = -1,
-        .devicePinDataReady = -1
-    };
-    ret = uDeviceOpen(&gDeviceCfg, &devHandle);
-    uPortLog("Opened device with return code %d.\n", ret);
-    if (ret == 0) {
-        // Bring up the GNSS network interface
-        uPortLog("Bringing up the network...\n");
-        if (uNetworkInterfaceUp(devHandle, U_NETWORK_TYPE_GNSS, &gNetworkCfg) == 0) {
-            if (0 != uGnssCfgValSet(devHandle, U_GNSS_CFG_VAL_KEY_ITEM_RATE_MEAS_U2, 100, U_GNSS_CFG_VAL_TRANSACTION_NONE, U_GNSS_CFG_VAL_LAYER_RAM))
-            {
-                ESP_LOGI("Config", "Failed to set rate");
-            }
-            
+    lv_style_t style_title;
+    lv_style_init(&style_title);
+    const lv_font_t * font_large = LV_FONT_DEFAULT;
+#if LV_FONT_MONTSERRAT_48
+    font_large     = &lv_font_montserrat_48;
+#endif
+    lv_style_set_text_font(&style_title, &lv_font_montserrat_24);
 
-            // Start to get location
-            uPortLog("Starting continuous location.\n");
-            uLocationGetContinuousStart(devHandle,
-                    100,
-                    U_LOCATION_TYPE_GNSS,
-                    NULL, NULL, callback);
+    lv_obj_t *cont = lv_obj_create(screen);
 
-            // // Stop getting location
-            // uLocationGetStop(devHandle);
-            //
-            // // When finished with the GNSS network layer
-            // uPortLog("Taking down GNSS...\n");
-            // uNetworkInterfaceDown(devHandle, U_NETWORK_TYPE_GNSS);
-        } else {
-            uPortLog("Unable to bring up GNSS!\n");
-        }
-    }
-    */
+    lv_obj_set_height(cont, lv_pct(100));
+    lv_obj_set_width(cont, lv_pct(100));
+    lv_obj_set_style_bg_color(cont, lv_color_black(), LV_STATE_DEFAULT);
 
-    lvgl_mux = xSemaphoreCreateMutex();
-    assert(lvgl_mux);
-    xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
+    lv_obj_t * meter = lv_meter_create(screen);
+    // lv_obj_remove_style(meter, NULL, LV_PART_MAIN);
+    // lv_obj_remove_style(meter, NULL, LV_PART_INDICATOR);
+    lv_obj_set_size(meter, 260, 260);
+    lv_obj_align(meter, LV_ALIGN_CENTER, 0, 0);
 
-    ESP_LOGI(TAG, "Display LVGL demos");
-    if (example_lvgl_lock(-1)) {
-        lv_demo_widgets();
-        // lv_demo_music();
-        // lv_demo_stress();
-        // lv_demo_benchmark();
+    // lv_obj_set_style_pad_hor(meter, 10, 0);
+    lv_obj_set_style_size(meter, 10, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(meter, LV_RADIUS_CIRCLE, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(meter, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(meter, lv_palette_darken(LV_PALETTE_GREY, 4), LV_PART_INDICATOR);
+    lv_obj_set_style_outline_color(meter, lv_color_white(), LV_PART_INDICATOR);
+    lv_obj_set_style_outline_width(meter, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(meter, lv_color_white(), LV_PART_TICKS);
 
-        example_lvgl_unlock();
-    }
+    lv_meter_scale_t * scale;
+    lv_meter_indicator_t * indic;
+    scale = lv_meter_add_scale(meter);
+    lv_meter_set_scale_range(meter, scale, 10, 90, 220, 360 - 220);
+    lv_meter_set_scale_ticks(meter, scale, 21, 3, 17, lv_color_white());
+    lv_meter_set_scale_major_ticks(meter, scale, 4, 4, 22, lv_color_white(), 15);
+
+    indic = lv_meter_add_arc(meter, scale, 10, lv_palette_main(LV_PALETTE_GREEN), 0);
+    lv_meter_set_indicator_start_value(meter, indic, 0);
+    lv_meter_set_indicator_end_value(meter, indic, 60);
+
+    indic = lv_meter_add_scale_lines(meter, scale, lv_palette_darken(LV_PALETTE_GREEN, 3),
+                                     lv_palette_darken(LV_PALETTE_GREEN, 3), true, 0);
+    lv_meter_set_indicator_start_value(meter, indic, 0);
+    lv_meter_set_indicator_end_value(meter, indic, 60);
+
+    indic = lv_meter_add_arc(meter, scale, 10, lv_palette_main(LV_PALETTE_RED), 0);
+    lv_meter_set_indicator_start_value(meter, indic, 60);
+    lv_meter_set_indicator_end_value(meter, indic, 90);
+
+    indic = lv_meter_add_scale_lines(
+        meter, scale, lv_palette_darken(LV_PALETTE_RED, 3),
+        lv_palette_darken(LV_PALETTE_RED, 3), true, 0);
+    lv_meter_set_indicator_start_value(meter, indic, 60);
+    lv_meter_set_indicator_end_value(meter, indic, 90);
+
+    lv_meter_indicator_t *needle = lv_meter_add_needle_line(
+        meter, scale, 4, lv_palette_darken(LV_PALETTE_GREY, 4), -25);
+
+    lv_obj_t * spd_label = lv_label_create(screen);
+    lv_obj_set_style_text_color(spd_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(spd_label, &lv_font_montserrat_12, 0);
+
+    lv_obj_t * spd_unit_label = lv_label_create(meter);
+    lv_label_set_text(spd_unit_label, "-");
+    lv_obj_set_style_text_font(spd_unit_label, &lv_font_montserrat_48, 0);
+    lv_obj_align(spd_unit_label, LV_ALIGN_CENTER, 60, 60);
+
+    lv_obj_align(spd_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    speed_label = spd_unit_label;
+    speed_needle = needle;
+    speed_meter = meter;
+    status_label = spd_label;
 }
