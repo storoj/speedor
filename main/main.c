@@ -20,6 +20,8 @@
 
 #include "ubxlib.h"
 
+#include "sd_card.h"
+
 void lv_app();
 void init_gps(char *status_msg);
 void init_gps_task(void*);
@@ -28,6 +30,8 @@ static lv_obj_t *speed_label;
 static lv_obj_t *speed_meter;
 static lv_meter_indicator_t *speed_needle;
 static lv_obj_t *status_label;
+static bool sd_card_ok = false;
+static FILE *sd_card_file = NULL;
 
 #define U_CFG_APP_GNSS_UART 1
 #define U_CFG_APP_PIN_GNSS_TXD 17
@@ -238,6 +242,7 @@ static void callback(uDeviceHandle_t devHandle,
     }
 }
 
+static uint64_t counter = 0;
 static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* pMessageId,
     int32_t errorCodeOrLength, void* pCallbackParam) {
     char* pBuffer = (char*)pCallbackParam;
@@ -286,6 +291,30 @@ static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* 
                         "spd_km_h: %"PRIi32"\n",
                         lat, lon, alt, hAcc, fix_status, sats_used, speed_mm_s, speed_km_h);
                 example_lvgl_unlock();
+
+
+                if (sd_card_ok) {
+                    if (!sd_card_file && utcTimeNanoseconds > 0) {
+                        char filename[256];
+                        sprintf(filename, "/sdcard/%"PRId64".dat", utcTimeNanoseconds);
+                        ESP_LOGI("SD", "Filename: %s", filename);
+                        sd_card_file = fopen(filename, "wb");
+                        if (!sd_card_file) {
+                            perror("fopen");
+                        }
+                        ESP_LOGI("SD", "File: %p", sd_card_file);
+                    }
+
+                    if (sd_card_file) {
+                        fwrite(pUbxNavPvt, sizeof(uGnssDecUbxNavPvt_t), 1, sd_card_file);
+                        if (counter % 100 == 0) {
+                            ESP_LOGI("SD", "Flush");
+                            fflush(sd_card_file);
+                        }
+                    }
+                }
+
+                counter++;
 
                 ESP_LOGI("Location",
                         "t: %"PRId64" "
@@ -440,6 +469,10 @@ void app_main(void)
     assert(lvgl_mux);
     xTaskCreate(example_lvgl_port_task, "LVGL", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, EXAMPLE_LVGL_TASK_PRIORITY, NULL);
 
+    if (ESP_OK == sd_card_init("/sdcard")) {
+        sd_card_ok = true;
+    }
+
     ESP_LOGI(TAG, "Display LVGL demos");
     if (example_lvgl_lock(-1)) {
         // lv_demo_widgets();
@@ -516,7 +549,27 @@ void init_gps(char *status_msg) {
     uDeviceHandle_t devHandle = NULL;
     ubx_err = uGnssAdd(module_type, U_GNSS_TRANSPORT_UART, transportHandle, -1, true, &devHandle);
     if (ubx_err) {
-      ESP_LOGE("GPS", "UBXLIB GNSS add error: %" PRIi32, ubx_err);
+      ESP_LOGE("GPS", "UBXLIB 9600 GNSS add error: %" PRIi32, ubx_err);
+      tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
+      return;
+    }
+    tail = status_append_fmt(status_msg, tail, " OK\n");
+
+    U_GNSS_CFG_SET_VAL_RAM(devHandle, UART1_BAUDRATE_U4, 921600);
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    uGnssRemove(devHandle);
+    uPortUartClose(transportHandle.uart);
+
+    tail = status_append_fmt(status_msg, tail, "UART 921600...");
+    transportHandle.uart = uPortUartOpen(
+        U_CFG_APP_GNSS_UART, 921600, NULL, U_GNSS_UART_BUFFER_LENGTH_BYTES,
+        U_CFG_APP_PIN_GNSS_TXD, U_CFG_APP_PIN_GNSS_RXD, U_CFG_APP_PIN_GNSS_CTS,
+        U_CFG_APP_PIN_GNSS_RTS);
+
+    ubx_err = uGnssAdd(module_type, U_GNSS_TRANSPORT_UART, transportHandle, -1, true, &devHandle);
+    if (ubx_err) {
+      ESP_LOGE("GPS", "UBXLIB 921600 GNSS add error: %" PRIi32, ubx_err);
       tail = status_append_fmt(status_msg, tail, " Fail: %"PRIi32, ubx_err);
       return;
     }
