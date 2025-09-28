@@ -21,6 +21,9 @@
 #include "ubxlib.h"
 
 #include "sd_card.h"
+#include <unistd.h>
+
+LV_FONT_DECLARE(sf_mono);
 
 void lv_app();
 void init_gps(char *status_msg);
@@ -30,6 +33,11 @@ static lv_obj_t *speed_label;
 static lv_obj_t *speed_meter;
 static lv_meter_indicator_t *speed_needle;
 static lv_obj_t *status_label;
+static lv_obj_t *time_label;
+static lv_obj_t *best_time_label;
+static lv_obj_t *prev_time_label;
+static lv_obj_t *lap_label;
+
 static bool sd_card_ok = false;
 static FILE *sd_card_file = NULL;
 
@@ -74,6 +82,69 @@ esp_lcd_touch_handle_t tp = NULL;
 #define EXAMPLE_LVGL_TASK_MIN_DELAY_MS 1
 #define EXAMPLE_LVGL_TASK_STACK_SIZE   (4 * 1024)
 #define EXAMPLE_LVGL_TASK_PRIORITY     2
+
+static uint64_t last_segment_time = 0;
+static uint64_t prev_segment_time = 0;
+static uint64_t best_segment_time = 0;
+static int lap = 0;
+
+typedef struct {
+    double A, B, C;
+} line_t;
+
+typedef struct {
+    double x, y;
+} point_t;
+
+line_t start_line;
+point_t last_coord = {.x = 0, .y = 0};
+
+static line_t line_two_points(point_t p1, point_t p2) {
+    line_t l;
+    l.A = p2.y - p1.y;
+    l.B = p1.x - p2.x;
+    l.C = -l.A*p2.x - l.B*p2.y;
+    return l;
+}
+
+static bool line_intersects_line(line_t l1, line_t l2, point_t *intersection) {
+    double denom = l1.A * l2.B - l2.A * l1.B;
+    if (denom == 0) {
+        return false;
+    }
+    if (intersection) {
+        *intersection = (point_t) {
+            .x = (l2.C * l1.B - l1.C * l2.B) / denom,
+                .y = (l2.A * l1.C - l1.A * l2.C) / denom
+        };
+    }
+    return true;
+}
+
+static bool line_intersects_segment(line_t l, point_t p1, point_t p2, point_t *intersection) {
+    bool a = l.A * p1.x + l.B * p1.y + l.C > 0;
+    bool b = l.A * p2.x + l.B * p2.y + l.C > 0;
+    return ((a ^ b) && line_intersects_line(l, line_two_points(p1, p2), intersection));
+}
+
+static void label_set_time(lv_obj_t *label, uint64_t usec) {
+    uint64_t msec = usec / 1000;
+    uint64_t sec = msec / 1000;
+
+    int frac = msec % 1000;
+    int mins = sec / 60;
+    int secs = sec % 60;
+
+    char buf[255];
+    sprintf(buf, "%d'%02d.%03d", mins, secs, frac);
+
+    lv_label_set_text(label, buf);
+}
+
+static void running_time_tick(void *) {
+    uint64_t usec = esp_timer_get_time() - last_segment_time;
+    label_set_time(time_label, usec);
+}
 
 static bool example_notify_lvgl_flush_ready(esp_lcd_panel_io_handle_t panel_io, esp_lcd_panel_io_event_data_t *edata, void *user_ctx)
 {
@@ -198,50 +269,6 @@ static void example_lvgl_port_task(void *arg)
     }
 }
 
-static char latLongToBits(int32_t thingX1e7,
-                          int32_t *pWhole,
-                          int32_t *pFraction)
-{
-    char prefix = '+';
-
-    // Deal with the sign
-    if (thingX1e7 < 0) {
-        thingX1e7 = -thingX1e7;
-        prefix = '-';
-    }
-    *pWhole = thingX1e7 / 10000000;
-    *pFraction = thingX1e7 % 10000000;
-
-    return prefix;
-}
-
-// Callback function to receive location.
-static void callback(uDeviceHandle_t devHandle,
-                     int32_t errorCode,
-                     const uLocation_t *pLocation)
-{
-    char prefix[2] = {0};
-    int32_t whole[2] = {0};
-    int32_t fraction[2] = {0};
-
-    // Not used
-    (void) devHandle;
-
-    if (errorCode == 0) {
-        prefix[0] = latLongToBits(pLocation->longitudeX1e7, &(whole[0]), &(fraction[0]));
-        prefix[1] = latLongToBits(pLocation->latitudeX1e7, &(whole[1]), &(fraction[1]));
-        ESP_LOGI("Location", "I am here: https://maps.google.com/?q=%c%d.%07d,%c%d.%07d\n",
-                 prefix[1], whole[1], fraction[1], prefix[0], whole[0], fraction[0]);
-        ESP_LOGI("Location", "Speed: %.3f m/s", ((double)pLocation->speedMillimetresPerSecond) / 1000);
-        ESP_LOGI("Location", "svs: %d", pLocation->svs);
-        ESP_LOGI("Location", "time: %"PRId64"", pLocation->timeUtc);
-    } else if (errorCode == U_ERROR_COMMON_TIMEOUT) {
-        ESP_LOGI("Location", "* Timeout");
-    } else {
-        ESP_LOGI("Location", "Error %d", errorCode);
-    }
-}
-
 static uint64_t counter = 0;
 static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* pMessageId,
     int32_t errorCodeOrLength, void* pCallbackParam) {
@@ -266,10 +293,38 @@ static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* 
 
                 utcTimeNanoseconds = uGnssDecUbxNavPvtGetTimeUtc(pUbxNavPvt);
 
+                int64_t cur_t = esp_timer_get_time();
+
                 int32_t lat = pUbxNavPvt->lat;
                 int32_t lon = pUbxNavPvt->lon;
                 int32_t alt = pUbxNavPvt->hMSL;
                 int32_t hAcc = pUbxNavPvt->hAcc;
+
+                point_t coord = {
+                    .x = (double)lat / 1e7,
+                    .y = (double)lon / 1e7
+                };
+
+                point_t intersection;
+                if (line_intersects_segment(start_line, last_coord, coord, &intersection)) {
+                    uint64_t segment_time = cur_t - last_segment_time;
+                    last_segment_time = cur_t;
+
+                    prev_segment_time = segment_time;
+                    if (best_segment_time == 0 || best_segment_time > segment_time) {
+                        best_segment_time = segment_time;
+                        label_set_time(best_time_label, best_segment_time);
+                    }
+
+                    lap++;
+                    char text[255];
+                    sprintf(text, "Lap %d", lap);
+                    lv_label_set_text(lap_label, text);
+
+                    label_set_time(prev_time_label, prev_segment_time);
+                }
+
+                last_coord = coord;
 
                 uGnssDecUbxNavPvtFixType_t fix_status = pUbxNavPvt->fixType;
 
@@ -306,10 +361,12 @@ static void gps_ubx_callback(uDeviceHandle_t devHandle, const uGnssMessageId_t* 
                     }
 
                     if (sd_card_file) {
+                        fwrite(&cur_t, sizeof(cur_t), 1, sd_card_file);
                         fwrite(pUbxNavPvt, sizeof(uGnssDecUbxNavPvt_t), 1, sd_card_file);
                         if (counter % 100 == 0) {
                             ESP_LOGI("SD", "Flush");
                             fflush(sd_card_file);
+                            fsync(fileno(sd_card_file));
                         }
                     }
                 }
@@ -483,6 +540,20 @@ void app_main(void)
         example_lvgl_unlock();
     }
     xTaskCreate(init_gps_task, "GPS_INIT", EXAMPLE_LVGL_TASK_STACK_SIZE, NULL, 3, NULL);
+
+    last_segment_time = esp_timer_get_time();
+    const esp_timer_create_args_t time_timer_args = {
+        .callback = &running_time_tick,
+        .name = "Running Time"
+    };
+    esp_timer_handle_t time_timer = NULL;
+    ESP_ERROR_CHECK(esp_timer_create(&time_timer_args, &time_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(time_timer, 100 * 1000));
+
+    start_line = line_two_points(
+            (point_t){.x = 52.040340, .y = -0.784706},
+            (point_t){.x = 52.040280, .y = -0.784570}
+            );
 }
 
 static void status_set_text_fmt(const char * fmt, ...) {
@@ -630,10 +701,10 @@ void init_gps(char *status_msg) {
     ESP_LOGI("CFG", "Dynamic model after: %"PRIi32, dynamic_model);
     tail = status_append_fmt(status_msg, tail, "Dynamic model after: %"PRIi32"\n", dynamic_model);
 
-    int32_t measprdms = 100;
+    int32_t measprdms = 40;
     int32_t measpernav = 1;
 
-    tail = status_append_fmt(status_msg, tail, "Set Rate 10hz...");
+    tail = status_append_fmt(status_msg, tail, "Set Rate 25hz...");
     ubx_err = uGnssCfgSetRate(devHandle, measprdms, measpernav, -1);
     if (ubx_err) {
         ESP_LOGE("GPS", "UBXLIB GNSS rate error: %" PRIi32, ubx_err);
@@ -671,13 +742,14 @@ void lv_app() {
 
     lv_obj_set_height(cont, lv_pct(100));
     lv_obj_set_width(cont, lv_pct(100));
+    lv_obj_set_style_bg_color(screen, lv_color_black(), LV_STATE_DEFAULT);
     lv_obj_set_style_bg_color(cont, lv_color_black(), LV_STATE_DEFAULT);
 
     lv_obj_t * meter = lv_meter_create(screen);
     // lv_obj_remove_style(meter, NULL, LV_PART_MAIN);
     // lv_obj_remove_style(meter, NULL, LV_PART_INDICATOR);
     lv_obj_set_size(meter, 260, 260);
-    lv_obj_align(meter, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(meter, LV_ALIGN_LEFT_MID, 0, 0);
 
     // lv_obj_set_style_pad_hor(meter, 10, 0);
     lv_obj_set_style_size(meter, 10, LV_PART_INDICATOR);
@@ -720,13 +792,38 @@ void lv_app() {
     lv_obj_t * spd_label = lv_label_create(screen);
     lv_obj_set_style_text_color(spd_label, lv_color_white(), 0);
     lv_obj_set_style_text_font(spd_label, &lv_font_montserrat_12, 0);
+    lv_obj_align(spd_label, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
 
     lv_obj_t * spd_unit_label = lv_label_create(meter);
     lv_label_set_text(spd_unit_label, "-");
     lv_obj_set_style_text_font(spd_unit_label, &lv_font_montserrat_48, 0);
     lv_obj_align(spd_unit_label, LV_ALIGN_CENTER, 60, 60);
 
-    lv_obj_align(spd_label, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_t *time_cont = lv_obj_create(screen);
+    lv_obj_align(time_cont, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_set_flex_flow(time_cont, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_width(time_cont, LV_SIZE_CONTENT);
+    lv_obj_set_height(time_cont, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(time_cont, lv_color_black(), LV_STATE_DEFAULT);
+
+    lap_label = lv_label_create(time_cont);
+    lv_obj_set_style_text_color(lap_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(lap_label, &sf_mono, 0);
+    lv_label_set_text(lap_label, "Lap");
+
+    time_label = lv_label_create(time_cont);
+    lv_obj_set_style_text_color(time_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(time_label, &sf_mono, 0);
+
+    prev_time_label = lv_label_create(time_cont);
+    lv_obj_set_style_text_color(prev_time_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(prev_time_label, &sf_mono, 0);
+    lv_label_set_text(prev_time_label, "Prev");
+
+    best_time_label = lv_label_create(time_cont);
+    lv_obj_set_style_text_color(best_time_label, lv_color_white(), 0);
+    lv_obj_set_style_text_font(best_time_label, &sf_mono, 0);
+    lv_label_set_text(best_time_label, "Best");
 
     speed_label = spd_unit_label;
     speed_needle = needle;
